@@ -1,0 +1,17 @@
+export const SERVICE_TYPES = [
+  'preventive',
+  'routine',
+  'repair',
+  'adblue',
+  'oil_change',
+  'tyre_retread',
+  'fc',
+  'inspection',
+  'wheel_alignment',
+  'battery',
+  'air_greese',
+  'water_wash',
+  'Body_work',
+  'tyres',
+  'other',
+];
