@@ -15,6 +15,7 @@ router.get('/', listVehicleAssignments);
 router.post('/', createVehicleAssignment);
 router.get('/:id/trip-sheets', listTripSheets);
 router.post('/:id/trip-sheets', authorize(ROLES.DRIVER), submitTripSheet);
+router.patch('/:id/trip-sheet', authorize(ROLES.DRIVER), submitTripSheet);
 router.patch('/:id/assign', authorize(...FLEET_MANAGERS), assignVehicleRequest);
 router.patch('/:id/status', updateVehicleAssignmentStatus);
 

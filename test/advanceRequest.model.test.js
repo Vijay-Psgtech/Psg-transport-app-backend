@@ -35,3 +35,11 @@ test('advance requests reject invalid amounts, distances, and states', () => {
   assert.equal(validation.errors.distanceKm.kind, 'min');
   assert.equal(validation.errors.status.kind, 'enum');
 });
+
+test('advance requests support idempotency keys', () => {
+  const request = validAdvance();
+  request.idempotencyKey = 'advance-submit-123';
+
+  assert.equal(request.validateSync(), undefined);
+  assert.equal(request.idempotencyKey, 'advance-submit-123');
+});

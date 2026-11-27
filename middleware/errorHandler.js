@@ -1,4 +1,5 @@
 import ApiError from '../utils/ApiError.js';
+import { log } from '../utils/logger.js';
 
 export const notFound = (req, _res, next) =>
   next(new ApiError(404, `Route not found: ${req.method} ${req.originalUrl}`));
@@ -25,7 +26,7 @@ export const errorHandler = (err, _req, res, _next) => {
   }
 
   if (status >= 500) {
-    console.error(err);
+    log('error', 'http_request_failed', { message: err.message, status });
     if (process.env.NODE_ENV === 'production') message = 'Internal server error';
   }
 

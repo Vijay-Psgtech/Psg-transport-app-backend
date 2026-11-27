@@ -54,9 +54,24 @@ export const listAdvanceRequests = asyncHandler(async (req, res) => {
 
 export const createAdvanceRequest = asyncHandler(async (req, res) => {
   let uploadedProof = req.file?.filename;
+  const idempotencyKey =
+    (typeof req.headers['idempotency-key'] === 'string' && req.headers['idempotency-key'].trim().slice(0, 100)) ||
+    (typeof req.body.idempotencyKey === 'string' ? req.body.idempotencyKey.trim().slice(0, 100) : undefined);
   try {
     const { assignmentId, destination, distanceKm, requestedAmount, purpose } = req.body;
     if (!mongoose.isValidObjectId(assignmentId)) throw new ApiError(400, 'Select a valid assigned trip');
+    if (idempotencyKey) {
+      const existing = await AdvanceRequest.findOne({
+        driver: req.user._id,
+        assignment: assignmentId,
+        idempotencyKey,
+      });
+      if (existing) {
+        if (uploadedProof) await removeAdvanceProofFile(uploadedProof);
+        uploadedProof = undefined;
+        return res.status(200).json({ data: existing, duplicate: true });
+      }
+    }
     if (typeof destination !== 'string' || !destination.trim() || destination.trim().length > 160) {
       throw new ApiError(400, 'Destination is required and must be 160 characters or fewer');
     }
@@ -90,6 +105,7 @@ export const createAdvanceRequest = asyncHandler(async (req, res) => {
       assignment: assignment._id,
       driver: req.user._id,
       vehicle: assignment.vehicle,
+      ...(idempotencyKey && { idempotencyKey }),
       destination: destination.trim(),
       distanceKm: distance,
       requestedAmount: amount,
@@ -110,6 +126,20 @@ export const createAdvanceRequest = asyncHandler(async (req, res) => {
     });
     res.status(201).json({ data: request });
   } catch (error) {
+    if (error?.code === 11000 && idempotencyKey) {
+      const existing = await AdvanceRequest.findOne({
+        driver: req.user._id,
+        assignment: req.body.assignmentId,
+        idempotencyKey,
+      }).populate(populated);
+      if (existing) {
+        if (uploadedProof) {
+          await removeAdvanceProofFile(uploadedProof);
+          uploadedProof = undefined;
+        }
+        return res.status(200).json({ data: existing, duplicate: true });
+      }
+    }
     if (uploadedProof) {
       try {
         await removeAdvanceProofFile(uploadedProof);
@@ -131,23 +161,31 @@ export const reviewAdvanceRequest = asyncHandler(async (req, res) => {
   if (note !== undefined && (typeof note !== 'string' || note.length > 500)) {
     throw new ApiError(400, 'Review note must be 500 characters or fewer');
   }
-  const request = await AdvanceRequest.findById(req.params.id);
-  if (!request) throw new ApiError(404, 'Advance request not found');
-  if (request.status !== 'pending') throw new ApiError(409, 'Only pending advances can be reviewed');
+  const existing = await AdvanceRequest.findById(req.params.id);
+  if (!existing) throw new ApiError(404, 'Advance request not found');
+  if (existing.status !== 'pending') throw new ApiError(409, 'Only pending advances can be reviewed');
 
-  const amount = approvedAmount === undefined || approvedAmount === '' ? request.requestedAmount : Number(approvedAmount);
+  const amount = approvedAmount === undefined || approvedAmount === '' ? existing.requestedAmount : Number(approvedAmount);
   if (decision === 'approved' && (!Number.isInteger(amount) || !numberInRange(amount, 1, 100000000))) {
     throw new ApiError(400, 'Approved amount must be a whole number between ₹1 and ₹10,00,00,000');
   }
-  request.status = decision;
-  request.review = {
-    reviewedBy: req.user._id,
-    reviewedAt: new Date(),
-    decision,
-    ...(decision === 'approved' && { approvedAmount: amount }),
-    ...(note?.trim() && { note: note.trim() }),
-  };
-  await request.save();
+  const request = await AdvanceRequest.findOneAndUpdate(
+    { _id: existing._id, status: 'pending' },
+    {
+      $set: {
+        status: decision,
+        review: {
+          reviewedBy: req.user._id,
+          reviewedAt: new Date(),
+          decision,
+          ...(decision === 'approved' && { approvedAmount: amount }),
+          ...(note?.trim() && { note: note.trim() }),
+        },
+      },
+    },
+    { new: true, runValidators: true }
+  );
+  if (!request) throw new ApiError(409, 'This advance was already reviewed');
   await request.populate(populated);
   await createNotification({
     recipient: request.driver,
@@ -165,10 +203,10 @@ export const acknowledgeAdvancePayment = asyncHandler(async (req, res) => {
   requireManager(req);
   if (!mongoose.isValidObjectId(req.params.id)) throw new ApiError(400, 'Advance request ID is invalid');
   const { paidAmount, note } = req.body;
-  const request = await AdvanceRequest.findById(req.params.id);
-  if (!request) throw new ApiError(404, 'Advance request not found');
-  if (request.status !== 'approved') throw new ApiError(409, 'Only approved advances can be acknowledged');
-  const amount = paidAmount === undefined || paidAmount === '' ? request.review.approvedAmount : Number(paidAmount);
+  const existing = await AdvanceRequest.findById(req.params.id);
+  if (!existing) throw new ApiError(404, 'Advance request not found');
+  if (existing.status !== 'approved') throw new ApiError(409, 'Only approved advances can be acknowledged');
+  const amount = paidAmount === undefined || paidAmount === '' ? existing.review.approvedAmount : Number(paidAmount);
   if (!Number.isInteger(amount) || !numberInRange(amount, 1, 100000000)) {
     throw new ApiError(400, 'Paid amount must be a whole number between ₹1 and ₹10,00,00,000');
   }
@@ -176,15 +214,23 @@ export const acknowledgeAdvancePayment = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Acknowledgement note must be 500 characters or fewer');
   }
 
-  request.status = 'acknowledged';
-  request.acknowledgement = {
-    acknowledgedBy: req.user._id,
-    acknowledgedAt: new Date(),
-    paidAmount: amount,
-    ...(note?.trim() && { note: note.trim() }),
-    receiptReference: `PAY-${request._id.toString().slice(-10).toUpperCase()}`,
-  };
-  await request.save();
+  const request = await AdvanceRequest.findOneAndUpdate(
+    { _id: existing._id, status: 'approved' },
+    {
+      $set: {
+        status: 'acknowledged',
+        acknowledgement: {
+          acknowledgedBy: req.user._id,
+          acknowledgedAt: new Date(),
+          paidAmount: amount,
+          ...(note?.trim() && { note: note.trim() }),
+          receiptReference: `PAY-${existing._id.toString().slice(-10).toUpperCase()}`,
+        },
+      },
+    },
+    { new: true, runValidators: true }
+  );
+  if (!request) throw new ApiError(409, 'This advance was already acknowledged or changed');
   await request.populate(populated);
   await createNotification({
     recipient: request.driver,

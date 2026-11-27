@@ -26,6 +26,7 @@ const vehicleAssignmentSchema = new Schema(
       required: function () { return this.type === 'request'; },
     },
     assignedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+    idempotencyKey: { type: String, trim: true, maxlength: 100 },
     startAt: {
       type: Date,
       required: function () { return this.type === 'request'; },
@@ -73,12 +74,25 @@ const vehicleAssignmentSchema = new Schema(
       default: 'pending',
       index: true,
     },
+    history: [{
+      fromStatus: { type: String, enum: ['pending', 'assigned', 'rejected', 'cancelled', 'completed'] },
+      toStatus: { type: String, enum: ['pending', 'assigned', 'rejected', 'cancelled', 'completed'], required: true },
+      changedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+      reason: { type: String, trim: true, maxlength: 500 },
+      vehicle: { type: Schema.Types.ObjectId, ref: 'Vehicle' },
+      driver: { type: Schema.Types.ObjectId, ref: 'User' },
+      changedAt: { type: Date, default: Date.now, required: true },
+    }],
   },
   { timestamps: true }
 );
 
 vehicleAssignmentSchema.index({ status: 1, startAt: 1, endAt: 1 });
 vehicleAssignmentSchema.index({ requestedBy: 1, createdAt: -1 });
+vehicleAssignmentSchema.index(
+  { requestedBy: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } }, name: 'uniq_request_idempotency_scope' }
+);
 vehicleAssignmentSchema.index({ vehicle: 1, status: 1, endAt: 1 });
 vehicleAssignmentSchema.index({ driver: 1, status: 1, endAt: 1 });
 

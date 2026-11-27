@@ -8,6 +8,7 @@ import { VEHICLE_TYPES } from '../constants/vehicle.js';
 import ApiError from '../utils/ApiError.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import { createNotification, notifyFleetManagers } from '../utils/notifications.js';
+import withAssignmentResourceLocks from '../utils/withAssignmentResourceLocks.js';
 
 const isManager = (user) => [ROLES.ADMIN, ROLES.TRANSPORT_OFFICER].includes(user.role);
 const assignmentPopulate = [
@@ -35,8 +36,26 @@ function getWindow(startValue, endValue) {
   return { startAt, endAt };
 }
 
-async function getAvailableOptions(endAt, passengerCount, preferredVehicleType) {
-  const busy = await VehicleAssignment.find({ status: 'assigned' }).select('vehicle driver');
+function assignmentOverlapFilter(startAt, endAt) {
+  if (!startAt && !endAt) return {};
+  return {
+    $or: [
+      { startAt: { $exists: false }, endAt: { $exists: false } },
+      {
+        $and: [
+          { startAt: { $exists: true, $lte: endAt } },
+          { endAt: { $exists: true, $gte: startAt } },
+        ],
+      },
+    ],
+  };
+}
+
+async function getAvailableOptions(startAt, endAt, passengerCount, preferredVehicleType) {
+  const busy = await VehicleAssignment.find({
+    status: 'assigned',
+    ...(startAt && endAt ? assignmentOverlapFilter(startAt, endAt) : {}),
+  }).select('vehicle driver');
   const busyVehicleIds = busy.map((item) => String(item.vehicle));
   const busyDriverIds = busy.map((item) => String(item.driver));
 
@@ -85,19 +104,23 @@ async function assertAvailable(vehicleId, driverId, startAt, endAt, passengerCou
     throw new ApiError(400, `${driver.name}'s driving licence is not valid through the requested assignment`);
   }
 
-  const activeVehicleAssignment = await VehicleAssignment.findOne({
+  const vehicleConflictFilter = {
     status: 'assigned',
     vehicle: vehicleId,
     ...(excludeAssignmentId && { _id: { $ne: excludeAssignmentId } }),
-  }).populate('vehicle', 'regNo');
+  };
+  if (startAt && endAt) Object.assign(vehicleConflictFilter, assignmentOverlapFilter(startAt, endAt));
+  const activeVehicleAssignment = await VehicleAssignment.findOne(vehicleConflictFilter).populate('vehicle', 'regNo');
   if (activeVehicleAssignment) {
     throw new ApiError(409, `Vehicle ${activeVehicleAssignment.vehicle?.regNo || ''} already has an active assignment`.trim());
   }
-  const activeDriverAssignment = await VehicleAssignment.findOne({
+  const driverConflictFilter = {
     status: 'assigned',
     driver: driverId,
     ...(excludeAssignmentId && { _id: { $ne: excludeAssignmentId } }),
-  }).populate('driver', 'name');
+  };
+  if (startAt && endAt) Object.assign(driverConflictFilter, assignmentOverlapFilter(startAt, endAt));
+  const activeDriverAssignment = await VehicleAssignment.findOne(driverConflictFilter).populate('driver', 'name');
   if (activeDriverAssignment) {
     throw new ApiError(409, `Driver ${activeDriverAssignment.driver?.name || ''} already has an active assignment`.trim());
   }
@@ -118,7 +141,7 @@ export const getAssignmentAvailability = asyncHandler(async (req, res) => {
   if (preferredVehicleType && !VEHICLE_TYPES.includes(preferredVehicleType)) {
     throw new ApiError(400, 'Vehicle type is invalid');
   }
-  res.json({ data: await getAvailableOptions(endAt, passengerCount, preferredVehicleType) });
+  res.json({ data: await getAvailableOptions(startAt, endAt, passengerCount, preferredVehicleType) });
 });
 
 // GET /api/vehicle-assignments?page=&limit=&status=
@@ -213,22 +236,39 @@ export const listDriverTrips = asyncHandler(async (req, res) => {
 export const createVehicleAssignment = asyncHandler(async (req, res) => {
   if (req.user.role === ROLES.TRANSPORT_USER) {
     const { startAt, endAt } = getWindow(req.body.startAt, req.body.endAt);
+    const idempotencyKey =
+      (typeof req.headers['idempotency-key'] === 'string' && req.headers['idempotency-key'].trim().slice(0, 100)) ||
+      (typeof req.body.idempotencyKey === 'string' ? req.body.idempotencyKey.trim().slice(0, 100) : undefined);
     if (req.body.preferredVehicleType && !VEHICLE_TYPES.includes(req.body.preferredVehicleType)) {
       throw new ApiError(400, 'Vehicle type is invalid');
     }
-    const assignment = await VehicleAssignment.create({
-      type: 'request',
-      status: 'pending',
-      requestedBy: req.user._id,
-      startAt,
-      endAt,
-      purpose: req.body.purpose,
-      preferredVehicleType: req.body.preferredVehicleType || undefined,
-      pickupLocation: req.body.pickupLocation,
-      destination: req.body.destination,
-      passengerCount: req.body.passengerCount,
-      notes: req.body.notes,
-    });
+    if (idempotencyKey) {
+      const existing = await VehicleAssignment.findOne({ requestedBy: req.user._id, idempotencyKey });
+      if (existing) return res.status(200).json({ data: existing, duplicate: true });
+    }
+    let assignment;
+    try {
+      assignment = await VehicleAssignment.create({
+        type: 'request',
+        status: 'pending',
+        requestedBy: req.user._id,
+        ...(idempotencyKey && { idempotencyKey }),
+        startAt,
+        endAt,
+        purpose: req.body.purpose,
+        preferredVehicleType: req.body.preferredVehicleType || undefined,
+        pickupLocation: req.body.pickupLocation,
+        destination: req.body.destination,
+        passengerCount: req.body.passengerCount,
+        notes: req.body.notes,
+      });
+    } catch (error) {
+      if (error?.code === 11000 && idempotencyKey) {
+        const existing = await VehicleAssignment.findOne({ requestedBy: req.user._id, idempotencyKey });
+        if (existing) return res.status(200).json({ data: existing, duplicate: true });
+      }
+      throw error;
+    }
     await assignment.populate(assignmentPopulate);
     await notifyFleetManagers({
       title: 'New vehicle request',
@@ -240,16 +280,40 @@ export const createVehicleAssignment = asyncHandler(async (req, res) => {
   }
 
   if (!isManager(req.user)) throw new ApiError(403, 'You do not have permission to create assignments', 'FORBIDDEN');
-  const { vehicle, driver } = await assertAvailable(req.body.vehicle, req.body.driver);
-  const assignment = await VehicleAssignment.create({
-    type: 'availability',
-    status: 'assigned',
-    vehicle: vehicle._id,
-    driver: driver._id,
-    assignedBy: req.user._id,
-    purpose: req.body.purpose,
-    notes: req.body.notes,
-  });
+  let startAt;
+  let endAt;
+  if (req.body.startAt || req.body.endAt) ({ startAt, endAt } = getWindow(req.body.startAt, req.body.endAt));
+  const { vehicle, driver, assignment } = await withAssignmentResourceLocks(
+    [`vehicle:${req.body.vehicle}`, `driver:${req.body.driver}`],
+    async () => {
+      const { vehicle, driver } = await assertAvailable(req.body.vehicle, req.body.driver, startAt, endAt);
+      let assignment;
+      try {
+        assignment = await VehicleAssignment.create({
+          type: 'availability',
+          status: 'assigned',
+          vehicle: vehicle._id,
+          driver: driver._id,
+          assignedBy: req.user._id,
+          ...(startAt && endAt && { startAt, endAt }),
+          purpose: req.body.purpose,
+          notes: req.body.notes,
+          history: [{
+            toStatus: 'assigned',
+            changedBy: req.user._id,
+            vehicle: vehicle._id,
+            driver: driver._id,
+          }],
+        });
+      } catch (error) {
+        if (error?.code === 11000) {
+          throw new ApiError(409, 'Vehicle or driver was assigned concurrently. Refresh availability and try again.');
+        }
+        throw error;
+      }
+      return { vehicle, driver, assignment };
+    }
+  );
   await assignment.populate(assignmentPopulate);
   await createNotification({
     recipient: driver._id,
@@ -309,24 +373,62 @@ export const submitTripSheet = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Trip notes must be 1,000 characters or fewer');
   }
 
+  const idempotencyKey =
+    (typeof req.headers['idempotency-key'] === 'string' && req.headers['idempotency-key'].trim().slice(0, 100)) ||
+    (typeof req.body.idempotencyKey === 'string' ? req.body.idempotencyKey.trim().slice(0, 100) : undefined);
+  if (idempotencyKey) {
+    const existing = await TripSheet.findOne({
+      driver: req.user._id,
+      assignment: req.params.id,
+      idempotencyKey,
+    });
+    if (existing) return res.status(200).json({ data: existing, duplicate: true });
+  }
+
   const assignment = await VehicleAssignment.findOne({
     _id: req.params.id,
     driver: req.user._id,
     status: 'assigned',
-  }).select('vehicle');
+  }).select('vehicle startAt endAt');
   if (!assignment) {
     throw new ApiError(404, 'Assigned trip not found or it has already been completed');
   }
-  const tripSheet = await TripSheet.create({
-    assignment: assignment._id,
-    driver: req.user._id,
-    vehicle: assignment.vehicle,
-    startOdometer,
-    endOdometer,
-    ...(fuelConsumed !== undefined && { fuelConsumed }),
-    ...(notes?.trim() && { notes: notes.trim() }),
-    submittedAt: new Date(),
-  });
+  if (assignment.startAt && assignment.endAt) {
+    const submittedAt = new Date();
+    if (submittedAt < assignment.startAt || submittedAt > assignment.endAt) {
+      throw new ApiError(400, 'Trip sheets must be submitted within the assigned trip window');
+    }
+  }
+  const previousSheet = await TripSheet.findOne({ assignment: assignment._id })
+    .sort({ submittedAt: -1 })
+    .select('endOdometer submittedAt');
+  if (previousSheet && startOdometer < previousSheet.endOdometer) {
+    throw new ApiError(400, `Start odometer cannot be lower than the previous entry (${previousSheet.endOdometer} km)`);
+  }
+  let tripSheet;
+  try {
+    tripSheet = await TripSheet.create({
+      assignment: assignment._id,
+      driver: req.user._id,
+      vehicle: assignment.vehicle,
+      startOdometer,
+      endOdometer,
+      ...(fuelConsumed !== undefined && { fuelConsumed }),
+      ...(notes?.trim() && { notes: notes.trim() }),
+      submittedAt: new Date(),
+      ...(idempotencyKey && { idempotencyKey }),
+    });
+  } catch (error) {
+    if (error?.code === 11000 && idempotencyKey) {
+      const existing = await TripSheet.findOne({
+        driver: req.user._id,
+        assignment: assignment._id,
+        idempotencyKey,
+      });
+      if (existing) return res.status(200).json({ data: existing, duplicate: true });
+    }
+    throw error;
+  }
   await notifyFleetManagers({
     title: 'Trip sheet submitted',
     body: `${req.user.name} submitted a trip sheet for assignment ${assignment._id}.`,
@@ -338,22 +440,55 @@ export const submitTripSheet = asyncHandler(async (req, res) => {
 
 // PATCH /api/vehicle-assignments/:id/assign
 export const assignVehicleRequest = asyncHandler(async (req, res) => {
-  const assignment = await VehicleAssignment.findOne({ _id: req.params.id, type: 'request', status: 'pending' });
+  let assignment = await VehicleAssignment.findOne({ _id: req.params.id, type: 'request', status: 'pending' });
   if (!assignment) throw new ApiError(404, 'Pending vehicle request not found');
-  const { vehicle, driver } = await assertAvailable(
-    req.body.vehicle,
-    req.body.driver,
-    assignment.startAt,
-    assignment.endAt,
-    assignment.passengerCount,
-    assignment.preferredVehicleType,
-    assignment._id
+  const { vehicle, driver, updatedAssignment } = await withAssignmentResourceLocks(
+    [`vehicle:${req.body.vehicle}`, `driver:${req.body.driver}`],
+    async () => {
+      const { vehicle, driver } = await assertAvailable(
+        req.body.vehicle,
+        req.body.driver,
+        assignment.startAt,
+        assignment.endAt,
+        assignment.passengerCount,
+        assignment.preferredVehicleType,
+        assignment._id
+      );
+      let updatedAssignment;
+      try {
+        updatedAssignment = await VehicleAssignment.findOneAndUpdate(
+          { _id: assignment._id, type: 'request', status: 'pending' },
+          {
+            $set: {
+              vehicle: vehicle._id,
+              driver: driver._id,
+              assignedBy: req.user._id,
+              status: 'assigned',
+            },
+            $push: {
+              history: {
+                fromStatus: 'pending',
+                toStatus: 'assigned',
+                changedBy: req.user._id,
+                vehicle: vehicle._id,
+                driver: driver._id,
+                changedAt: new Date(),
+              },
+            },
+          },
+          { new: true, runValidators: true }
+        );
+      } catch (error) {
+        if (error?.code === 11000) {
+          throw new ApiError(409, 'Vehicle or driver was assigned concurrently. Refresh availability and try again.');
+        }
+        throw error;
+      }
+      if (!updatedAssignment) throw new ApiError(409, 'This request was already assigned or changed');
+      return { vehicle, driver, updatedAssignment };
+    }
   );
-  assignment.vehicle = vehicle._id;
-  assignment.driver = driver._id;
-  assignment.assignedBy = req.user._id;
-  assignment.status = 'assigned';
-  await assignment.save();
+  assignment = updatedAssignment;
   await assignment.populate(assignmentPopulate);
   await createNotification({
     recipient: assignment.driver,
@@ -375,10 +510,13 @@ export const assignVehicleRequest = asyncHandler(async (req, res) => {
 // PATCH /api/vehicle-assignments/:id/status { status }
 export const updateVehicleAssignmentStatus = asyncHandler(async (req, res) => {
   const { status } = req.body;
-  const assignment = await VehicleAssignment.findById(req.params.id);
+  let assignment = await VehicleAssignment.findById(req.params.id);
   if (!assignment) throw new ApiError(404, 'Vehicle assignment not found');
 
   if (req.user.role === ROLES.TRANSPORT_USER) {
+    if (assignment.requestedBy?.equals(req.user._id) && assignment.status === 'cancelled' && status === 'cancelled') {
+      return res.json({ data: assignment, duplicate: true });
+    }
     if (!assignment.requestedBy?.equals(req.user._id) || assignment.status !== 'pending' || status !== 'cancelled') {
       throw new ApiError(403, 'You can only cancel your own pending vehicle requests', 'FORBIDDEN');
     }
@@ -392,8 +530,29 @@ export const updateVehicleAssignmentStatus = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Only assigned trips can be completed');
   }
 
-  assignment.status = status;
-  await assignment.save();
+  const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 500) : undefined;
+  const previousStatus = assignment.status;
+  const filter = { _id: assignment._id, status: previousStatus };
+  const updatedAssignment = await VehicleAssignment.findOneAndUpdate(
+    filter,
+    {
+      $set: { status },
+      $push: {
+        history: {
+          fromStatus: previousStatus,
+          toStatus: status,
+          changedBy: req.user._id,
+          reason,
+          vehicle: assignment.vehicle,
+          driver: assignment.driver,
+          changedAt: new Date(),
+        },
+      },
+    },
+    { new: true, runValidators: true }
+  );
+  if (!updatedAssignment) throw new ApiError(409, 'This assignment changed before the status update completed');
+  assignment = updatedAssignment;
   await assignment.populate(assignmentPopulate);
   if (assignment.requestedBy) {
     const title = status === 'rejected'

@@ -39,11 +39,16 @@ const advanceRequestSchema = new Schema(
       note: { type: String, trim: true, maxlength: 500 },
       receiptReference: String,
     },
+    idempotencyKey: { type: String, trim: true, maxlength: 100 },
   },
   { timestamps: true }
 );
 
 advanceRequestSchema.index({ driver: 1, createdAt: -1 });
 advanceRequestSchema.index({ status: 1, createdAt: -1 });
+advanceRequestSchema.index(
+  { driver: 1, assignment: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } }, name: 'uniq_advance_idempotency_scope' }
+);
 
 export default mongoose.model('AdvanceRequest', advanceRequestSchema);

@@ -33,11 +33,16 @@ const tripSheetSchema = new Schema(
     fuelConsumed: { type: Number, min: 0, max: 100000 },
     notes: { type: String, trim: true, maxlength: 1000 },
     submittedAt: { type: Date, required: true },
+    idempotencyKey: { type: String, trim: true, maxlength: 100 },
   },
   { timestamps: true }
 );
 
 tripSheetSchema.index({ assignment: 1, submittedAt: -1 });
 tripSheetSchema.index({ driver: 1, submittedAt: -1 });
+tripSheetSchema.index(
+  { driver: 1, assignment: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } }, name: 'uniq_trip_idempotency_scope' }
+);
 
 export default mongoose.model('TripSheet', tripSheetSchema);
